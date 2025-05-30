@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Simple SSH WebSocket Test (Node.js)</title>
+    <style>
+        body { font-family: monospace; background-color: #1e1e1e; color: #d4d4d4; margin: 0; padding: 10px; display: flex; flex-direction: column; height: calc(100vh - 20px); }
+        #terminal { flex-grow: 1; border: 1px solid #555; padding: 5px; overflow-y: auto; white-space: pre-wrap; }
+        #inputLine { display: flex; margin-top: 5px; }
+        #sshInput { flex-grow: 1; background-color: #333; color: #d4d4d4; border: 1px solid #555; padding: 5px; }
+        button { margin-left: 5px; padding: 5px 10px; }
+        .controls { margin-bottom: 10px; }
+        input[type="text"], input[type="password"], input[type="number"], textarea, select { margin-right: 5px; padding: 3px; background-color: #333; color: #d4d4d4; border: 1px solid #555; }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        Host: <input type="text" id="host" value="your_vps_ip">
+        Port: <input type="number" id="port" value="22">
+        User: <input type="text" id="username" value="your_username">
+        Auth Type:
+        <select id="authType">
+            <option value="password">Password</option>
+            <option value="key">Private Key</option>
+        </select>
+        <br>
+        Password/Key: <textarea id="authValue" rows="3" cols="40" placeholder="Enter password or private key content"></textarea>
+        <button onclick="connectSsh()">Connect SSH</button>
+        <button onclick="disconnectSsh()" id="disconnectBtn" style="display:none;">Disconnect</button>
+    </div>
+    <div id="terminal"></div>
+    <div id="inputLine">
+        <input type="text" id="sshInput" placeholder="Enter command..." disabled onkeydown="handleInput(event)">
+    </div>
+
+    <script>
+        let ws;
+        const terminal = document.getElementById('terminal');
+        const sshInput = document.getElementById('sshInput');
+        const disconnectBtn = document.getElementById('disconnectBtn');
+        const connectBtn = document.querySelector('.controls button[onclick="connectSsh()"]');
+
+
+        function appendToTerminal(data) {
+            terminal.textContent += data;
+            terminal.scrollTop = terminal.scrollHeight; // Auto-scroll
+        }
+
+        function connectSsh() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                appendToTerminal("\r\nAlready connected. Please close the current session first.\r\n");
+                return;
+            }
+
+            const host = document.getElementById('host').value;
+            const port = parseInt(document.getElementById('port').value);
+            const username = document.getElementById('username').value;
+            const authType = document.getElementById('authType').value;
+            const authValue = document.getElementById('authValue').value;
+
+            if (!host || !username || !authValue) {
+                alert("Host, Username, and Password/Key are required!");
+                return;
+            }
+
+            const nodeInfo = {
+                name: "my-vps-node", // Can be dynamic
+                host: host,
+                port: port,
+                username: username,
+                auth_type: authType,
+                auth_value: authValue
+            };
+            
+            // Node.js服务器默认端口 (例如3000)
+            const serverPort = 3000; // <--- 修改这里以匹配你的Node.js服务器端口
+            const wsUrl = `ws://${window.location.hostname}:${serverPort}/ws/ssh/my-vps-node`;
+            ws = new WebSocket(wsUrl);
+            appendToTerminal(`Attempting to connect to ${wsUrl}...\r\n`);
+            connectBtn.disabled = true;
+
+
+            ws.onopen = function() {
+                appendToTerminal("WebSocket connection established. Sending Node info...\r\n");
+                ws.send(JSON.stringify(nodeInfo));
+                sshInput.disabled = false;
+                sshInput.focus();
+                disconnectBtn.style.display = 'inline-block';
+            };
+
+            ws.onmessage = function(event) {
+                appendToTerminal(event.data);
+            };
+
+            ws.onclose = function(event) {
+                appendToTerminal(`\r\nWebSocket connection closed. Code: ${event.code}, Reason: ${event.reason || 'N/A'}\r\n`);
+                sshInput.disabled = true;
+                disconnectBtn.style.display = 'none';
+                connectBtn.disabled = false;
+            };
+
+            ws.onerror = function(error) {
+                appendToTerminal(`\r\nWebSocket error: ${(error.message || 'Unknown error')}\r\n`);
+                console.error("WebSocket Error: ", error);
+                sshInput.disabled = true;
+                disconnectBtn.style.display = 'none';
+                connectBtn.disabled = false;
+            };
+        }
+
+        function disconnectSsh() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.close();
+            }
+            appendToTerminal("\r\nDisconnected by user.\r\n");
+            sshInput.disabled = true;
+            disconnectBtn.style.display = 'none';
+            connectBtn.disabled = false;
+        }
+
+
+        function handleInput(event) {
+            if (event.key === "Enter") {
+                const command = sshInput.value;
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(command + "\n"); // Send command with newline
+                }
+                sshInput.value = ""; // Clear input field
+            }
+        }
+    </script>
+</body>
+</html>
+
