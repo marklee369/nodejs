@@ -1,15 +1,19 @@
 const express = require('express');
-const http = require('http');
+const http = require('http'); // 改回使用 http 模块
 const WebSocket = require('ws');
 const { Client } = require('ssh2');
 const path = require('path');
 const cors = require('cors');
 const { z, ZodError } = require('zod');
 
-const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server }); // 将 WebSocket 服务器附加到 HTTP 服务器
+// helmet 模块已移除，不再引入
+// const helmet = require('helmet');
 
+const app = express();
+const server = http.createServer(app); // 使用 http 服务器
+const wss = new WebSocket.Server({ server }); // WebSocket 服务器附加到 HTTP 服务器
+
+// Koyeb 会通过环境变量 PORT 提供端口，本地开发可使用默认值 3000
 const PORT = process.env.PORT || 3000;
 
 // --- Zod Schemas (类似 Pydantic 模型) ---
@@ -28,6 +32,10 @@ const NodeSchema = z.object({
 app.use(cors()); // 启用 CORS
 app.use(express.json()); // 解析 JSON 请求体
 app.use(express.static(path.join(__dirname, 'static'))); // 提供静态文件
+
+// helmet 中间件已移除
+// app.use(helmet());
+// 或 app.use(helmet.contentSecurityPolicy({...}));
 
 // --- 根路径提供前端 ---
 app.get('/', (req, res) => {
@@ -99,16 +107,13 @@ app.post('/api/ssh/test', async (req, res) => {
         finishRequest();
     }
 
-
     function finishRequest() {
         if (conn) conn.end(); // Ensure connection is closed
         
         const timeElapsed = (Date.now() - startTime) / 1000;
         const nodeResponse = { ...nodeInput, auth_value: '***' };
 
-        // Avoid sending response multiple times
         if (!res.headersSent) {
-             // If connectionError occurred, success is definitely false
             if (connectionError && success) {
                 success = false;
             }
@@ -124,11 +129,11 @@ app.post('/api/ssh/test', async (req, res) => {
     }
 });
 
-
 // --- WebSocket SSH Shell ---
 wss.on('connection', (ws, req) => {
-    // req.url can be used to get the path, e.g., /ws/ssh/some_node_name
-    console.log(`WebSocket client connected from ${req.socket.remoteAddress} to ${req.url}`);
+    // 对于Koyeb等平台，req.socket.remoteAddress 可能是代理的地址
+    // 若要获取真实IP，可能需要检查 X-Forwarded-For 等头部 (需Koyeb配置支持)
+    console.log(`WebSocket client connected from ${req.headers['x-forwarded-for'] || req.socket.remoteAddress} to ${req.url}`);
     let sshConn = new Client();
     let sshStream = null;
 
@@ -226,12 +231,15 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-
 // --- 启动服务器 ---
 server.listen(PORT, () => {
-    console.log(`Server is listening on http://localhost:${PORT}`);
-    console.log(`Frontend (if static/index.html exists): http://localhost:${PORT}/`);
-    console.log(`API endpoint for SSH test: POST http://localhost:${PORT}/api/ssh/test`);
-    console.log(`WebSocket endpoint for SSH shell: ws://localhost:${PORT}/ws/ssh/{node_name}`);
+    // 本地运行时，通常是 http://localhost:PORT
+    // 在 Koyeb 上，应用监听 $PORT，但通过 Koyeb 的域名访问 (通常是 HTTPS)
+    console.log(`Server is listening on internal port: ${PORT}`);
+    console.log(`To access the app on Koyeb, use your Koyeb service URL (e.g., https://your-app-name.koyeb.app)`);
+    console.log(`Frontend (if static/index.html exists): accessible via your Koyeb URL /`);
+    console.log(`API endpoint for SSH test: POST to your Koyeb URL /api/ssh/test`);
+    console.log(`WebSocket endpoint for SSH shell: connect to wss://your-koyeb-url (path might be /ws/ssh/ or just / depending on proxy)`);
 });
+
 
