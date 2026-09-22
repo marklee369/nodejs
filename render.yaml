@@ -11,11 +11,7 @@ services:
       - key: NODE_ENV
         value: production
 
-      - key: API_TOKEN
-        sync: false
-
-      - key: ALLOWED_ORIGINS
-        sync: false
+      - fromGroup: backend-secrets
 
       - key: TRUST_PROXY_HOPS
         value: "1"
