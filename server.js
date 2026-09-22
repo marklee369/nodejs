@@ -179,17 +179,10 @@ const blockedRanges = new net.BlockList();
     ['fc00::', 7], ['fe80::', 10], ['ff00::', 8],
 ].forEach(([addr, prefix]) => blockedRanges.addSubnet(addr, prefix, 'ipv6'));
 
-/**
- * 解析并校验目标主机，返回“已校验过的 IP”。
- * 后续直接用该 IP 建立连接，避免 DNS rebinding（校验时和连接时解析结果不一致）。
- */
 async function resolveTarget(host) {
-    if (ALLOWED_TARGET_HOSTS.length > 0 && !ALLOWED_TARGET_HOSTS.includes(host.toLowerCase())) {
-        throw new PublicError('Target host is not allowed', 403);
-    }
-
     let addresses;
     const ipFamily = net.isIP(host);
+
     if (ipFamily) {
         addresses = [{ address: host, family: ipFamily }];
     } else {
@@ -200,13 +193,20 @@ async function resolveTarget(host) {
         }
     }
 
+    if (!addresses.length) {
+        throw new PublicError('Unable to resolve host', 502);
+    }
+
     if (!ALLOW_PRIVATE_TARGETS) {
         for (const { address, family } of addresses) {
-            if (blockedRanges.check(address, family === 6 ? 'ipv6' : 'ipv4')) {
-                throw new PublicError('Target host is not allowed', 403);
+            const addressType = Number(family) === 6 ? 'ipv6' : 'ipv4';
+
+            if (blockedRanges.check(address, addressType)) {
+                throw new PublicError('Target address is private or reserved', 403);
             }
         }
     }
+
     return addresses[0].address;
 }
 
