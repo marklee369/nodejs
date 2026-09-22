@@ -10,7 +10,3 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: API_TOKEN
-        sync: false          # 在 Render 控制台里手动填写，不要提交到仓库
-      - key: ALLOWED_ORIGINS
-        sync: false          # 部署好前端后，填 Vercel 域名
