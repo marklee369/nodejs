@@ -168,16 +168,48 @@ const ResizeFrameSchema = z.object({
 // =====================================================================
 // SSRF 防护：目标地址校验
 // =====================================================================
-const blockedRanges = new net.BlockList();
+const blockedIpv4Ranges = new net.BlockList();
+const blockedIpv6Ranges = new net.BlockList();
+
 [
-    ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8],
-    ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.168.0.0', 16],
-    ['198.18.0.0', 15], ['224.0.0.0', 4], ['240.0.0.0', 4],
-].forEach(([addr, prefix]) => blockedRanges.addSubnet(addr, prefix, 'ipv4'));
+    ['0.0.0.0', 8],
+    ['10.0.0.0', 8],
+    ['100.64.0.0', 10],
+    ['127.0.0.0', 8],
+    ['169.254.0.0', 16],
+    ['172.16.0.0', 12],
+    ['192.0.0.0', 24],
+    ['192.168.0.0', 16],
+    ['198.18.0.0', 15],
+    ['224.0.0.0', 4],
+    ['240.0.0.0', 4],
+].forEach(([address, prefix]) => {
+    blockedIpv4Ranges.addSubnet(address, prefix, 'ipv4');
+});
+
 [
-    ['::', 128], ['::1', 128], ['::ffff:0:0', 96], ['64:ff9b::', 96],
-    ['fc00::', 7], ['fe80::', 10], ['ff00::', 8],
-].forEach(([addr, prefix]) => blockedRanges.addSubnet(addr, prefix, 'ipv6'));
+    ['::', 128],
+    ['::1', 128],
+    ['64:ff9b::', 96],
+    ['fc00::', 7],
+    ['fe80::', 10],
+    ['ff00::', 8],
+].forEach(([address, prefix]) => {
+    blockedIpv6Ranges.addSubnet(address, prefix, 'ipv6');
+});
+
+function isBlockedAddress(address, family) {
+    if (Number(family) === 4) {
+        return blockedIpv4Ranges.check(address, 'ipv4');
+    }
+
+    if (Number(family) === 6) {
+        return blockedIpv6Ranges.check(address, 'ipv6');
+    }
+
+    return true;
+}
+
 
 async function resolveTarget(host) {
     let addresses;
@@ -199,9 +231,7 @@ async function resolveTarget(host) {
 
     if (!ALLOW_PRIVATE_TARGETS) {
         for (const { address, family } of addresses) {
-            const addressType = Number(family) === 6 ? 'ipv6' : 'ipv4';
-
-            if (blockedRanges.check(address, addressType)) {
+            if (isBlockedAddress(address, family)) {
                 throw new PublicError('Target address is private or reserved', 403);
             }
         }
@@ -209,6 +239,7 @@ async function resolveTarget(host) {
 
     return addresses[0].address;
 }
+
 
 // =====================================================================
 // SSH 连接
