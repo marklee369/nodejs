@@ -17,7 +17,7 @@ services:
         value: "1"
 
       - key: ALLOW_PRIVATE_TARGETS
-        value: "true"
+        value: "false"
 
       - key: REQUIRE_HOST_FINGERPRINT
         value: "false"
