@@ -14,10 +14,10 @@ services:
       - fromGroup: backend-secrets
 
       - key: TRUST_PROXY_HOPS
-        value: "1"
+        value: 1
 
       - key: ALLOW_PRIVATE_TARGETS
-        value: "false"
+        value: false
 
       - key: REQUIRE_HOST_FINGERPRINT
-        value: "false"
+        value: false
