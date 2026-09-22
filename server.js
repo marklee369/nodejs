@@ -14,7 +14,7 @@ const { z, ZodError } = require('zod');
 // =====================================================================
 // 配置（全部来自环境变量）
 // =====================================================================
-//   API_TOKEN               必填。仅保护 /api，不进入浏览器，不用于浏览器 WebSocket 握手。
+//   API_TOKEN               必填。API / 浏览器 WebSocket 的访问令牌；WebSocket 中只会在 E2E 加密载荷里出现。
 //   ALLOWED_ORIGINS         强烈建议设置。逗号分隔的允许来源，例如前端部署在 Vercel 后的域名
 //                           （https://your-app.vercel.app）。前后端分离部署后不再有"默认可信来源"，
 //                           不设置时仅在非生产环境放行 http://localhost:5173 方便本地调试。
@@ -58,6 +58,7 @@ try {
 const TRUST_PROXY_HOPS = Math.max(0, parseInt(process.env.TRUST_PROXY_HOPS || '0', 10) || 0);
 const ALLOW_PRIVATE_TARGETS = process.env.ALLOW_PRIVATE_TARGETS === 'true';
 const REQUIRE_HOST_FINGERPRINT = process.env.REQUIRE_HOST_FINGERPRINT === 'true';
+const REQUIRE_ACCESS_TOKEN = process.env.REQUIRE_ACCESS_TOKEN !== 'false';
 
 const allowedOrigins = process.env.ALLOWED_ORIGINS
     ? csv(process.env.ALLOWED_ORIGINS)
@@ -621,6 +622,7 @@ function handleWebSocketConnection(ws, req, clientIp) {
 
         // Handshake is the only unencrypted frame, and it contains only:
         // RSA-OAEP wrapped ephemeral AES key + AES-GCM ciphertext.
+        // The access token itself is inside that AES-GCM ciphertext.
         if (state !== 'awaiting_handshake' || isBinary) return;
 
         state = 'connecting';
@@ -848,5 +850,6 @@ server.listen(PORT, () => {
     console.log(`Server is running on port: ${PORT}`);
     console.log(`Allowed Origins: ${allowedOrigins.join(', ')}`);
     console.log(`Private targets ${ALLOW_PRIVATE_TARGETS ? 'ALLOWED' : 'blocked'}; proxy hops: ${TRUST_PROXY_HOPS}`);
+    console.log(`Access token required: ${REQUIRE_ACCESS_TOKEN}`);
     if (!IS_PRODUCTION) console.log('NODE_ENV is not "production"');
 });
