@@ -14,13 +14,13 @@ const { z, ZodError } = require('zod');
 // =====================================================================
 // 配置（全部来自环境变量）
 // =====================================================================
-//   API_TOKEN               必填。访问 API / WebSocket 的令牌（≥16 字符，建议 openssl rand -hex 32）
+//   API_TOKEN               必填。仅保护 /api，不进入浏览器，不用于浏览器 WebSocket 握手。
 //   ALLOWED_ORIGINS         强烈建议设置。逗号分隔的允许来源，例如前端部署在 Vercel 后的域名
 //                           （https://your-app.vercel.app）。前后端分离部署后不再有"默认可信来源"，
 //                           不设置时仅在非生产环境放行 http://localhost:5173 方便本地调试。
 //   TRUST_PROXY_HOPS        可选。前面有几层可信反向代理（Render 的边缘代理等），默认 0
 //   ALLOW_PRIVATE_TARGETS   可选。设为 true 才允许连接内网/回环/链路本地地址，默认禁止
-//   REQUIRE_HOST_FINGERPRINT可选。设为 true 则强制客户端提供 host_fingerprint（防中间人）
+//   REQUIRE_HOST_FINGERPRINT可选。设为 true 则强制客户端提供 host_fingerprint。st_fingerprint（防中间人）
 const PORT = process.env.PORT || 3000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
@@ -32,6 +32,28 @@ if (API_TOKEN.length < 16) {
     process.exit(1);
 }
 const API_TOKEN_HASH = crypto.createHash('sha256').update(API_TOKEN).digest();
+
+// E2E application-layer encryption:
+// - Browser receives ONLY the public key.
+// - Backend keeps the RSA private key exclusively in E2E_PRIVATE_KEY_PEM.
+// - SSH credentials, host data, PTY controls, keyboard input and SSH output
+//   are encrypted with an ephemeral AES-256-GCM session key.
+const E2E_PRIVATE_KEY_PEM = process.env.E2E_PRIVATE_KEY_PEM || '';
+if (!E2E_PRIVATE_KEY_PEM) {
+    console.error('FATAL: 必须设置 E2E_PRIVATE_KEY_PEM（RSA 私钥 PEM）。私钥不得放入前端。');
+    process.exit(1);
+}
+let E2E_PUBLIC_KEY_PEM;
+try {
+    const privateKey = crypto.createPrivateKey(E2E_PRIVATE_KEY_PEM);
+    E2E_PUBLIC_KEY_PEM = crypto.createPublicKey(privateKey).export({
+        type: 'spki',
+        format: 'pem',
+    });
+} catch (error) {
+    console.error('FATAL: E2E_PRIVATE_KEY_PEM 不是有效的 RSA 私钥 PEM:', error.message);
+    process.exit(1);
+}
 
 const TRUST_PROXY_HOPS = Math.max(0, parseInt(process.env.TRUST_PROXY_HOPS || '0', 10) || 0);
 const ALLOW_PRIVATE_TARGETS = process.env.ALLOW_PRIVATE_TARGETS === 'true';
@@ -120,6 +142,90 @@ function createRateLimiter({ windowMs, max }) {
 
 const httpRateLimit = createRateLimiter(LIMITS.HTTP_RATE);
 const wsRateLimit = createRateLimiter(LIMITS.WS_RATE);
+
+const E2E_VERSION = 1;
+const E2E_RSA_PADDING = crypto.constants.RSA_PKCS1_OAEP_PADDING;
+const E2E_RSA_HASH = 'sha256';
+const E2E_IV_BYTES = 12;
+const E2E_MAX_PLAINTEXT_BYTES = 24 * 1024;
+
+// base64url is compact and safe inside JSON/WebSocket text frames.
+function b64uEncode(buffer) {
+    return Buffer.from(buffer).toString('base64url');
+}
+function b64uDecode(value, label = 'base64url field') {
+    if (typeof value !== 'string' || value.length === 0 || value.length > 100_000) {
+        throw new PublicError(`Invalid ${label}`);
+    }
+    try {
+        return Buffer.from(value, 'base64url');
+    } catch {
+        throw new PublicError(`Invalid ${label}`);
+    }
+}
+
+function rsaUnwrapSessionKey(wrapped) {
+    try {
+        const key = crypto.privateDecrypt(
+            {
+                key: E2E_PRIVATE_KEY_PEM,
+                padding: E2E_RSA_PADDING,
+                oaepHash: E2E_RSA_HASH,
+            },
+            wrapped,
+        );
+        if (key.length !== 32) throw new Error('unexpected AES key length');
+        return key;
+    } catch {
+        throw new PublicError('Invalid encrypted handshake');
+    }
+}
+
+function aesDecrypt(sessionKey, envelope, direction) {
+    if (!envelope || envelope.v !== E2E_VERSION || envelope.type !== 'data') {
+        throw new PublicError('Invalid encrypted frame');
+    }
+    if (!Number.isSafeInteger(envelope.seq) || envelope.seq < 0) {
+        throw new PublicError('Invalid encrypted frame sequence');
+    }
+
+    const iv = b64uDecode(envelope.iv, 'IV');
+    const ciphertext = b64uDecode(envelope.data, 'ciphertext');
+    if (iv.length !== E2E_IV_BYTES || ciphertext.length < 16 || ciphertext.length > E2E_MAX_PLAINTEXT_BYTES + 16) {
+        throw new PublicError('Invalid encrypted frame');
+    }
+
+    const aad = Buffer.from(`ssh-gateway:v${E2E_VERSION}:${direction}:${envelope.seq}`, 'utf8');
+    try {
+        const decipher = crypto.createDecipheriv('aes-256-gcm', sessionKey, iv);
+        decipher.setAAD(aad);
+        const tag = ciphertext.subarray(ciphertext.length - 16);
+        decipher.setAuthTag(tag);
+        return Buffer.concat([
+            decipher.update(ciphertext.subarray(0, -16)),
+            decipher.final(),
+        ]);
+    } catch {
+        throw new PublicError('Encrypted frame authentication failed');
+    }
+}
+
+function aesEncrypt(sessionKey, seq, plaintext, direction) {
+    const input = Buffer.isBuffer(plaintext) ? plaintext : Buffer.from(String(plaintext), 'utf8');
+    if (input.length > E2E_MAX_PLAINTEXT_BYTES) throw new PublicError('Encrypted payload too large');
+    const iv = crypto.randomBytes(E2E_IV_BYTES);
+    const aad = Buffer.from(`ssh-gateway:v${E2E_VERSION}:${direction}:${seq}`, 'utf8');
+    const cipher = crypto.createCipheriv('aes-256-gcm', sessionKey, iv);
+    cipher.setAAD(aad);
+    const ciphertext = Buffer.concat([cipher.update(input), cipher.final(), cipher.getAuthTag()]);
+    return JSON.stringify({
+        v: E2E_VERSION,
+        type: 'data',
+        seq,
+        iv: b64uEncode(iv),
+        data: b64uEncode(ciphertext),
+    });
+}
 
 /** 常量时间比较令牌 */
 function isValidToken(candidate) {
@@ -368,6 +474,11 @@ const apiGuards = {
 
 app.use('/api', apiGuards.origin, apiGuards.noStore, apiGuards.rateLimit);
 
+// --- Public E2E key. This endpoint exposes no secret; only the RSA public key. ---
+app.get('/e2e/public-key', apiGuards.origin, apiGuards.noStore, (req, res) => {
+    res.type('text/plain').send(E2E_PUBLIC_KEY_PEM);
+});
+
 // --- Health check (used by Render, uptime monitors, etc.) ---
 // Deliberately not under /api so it isn't subject to apiGuards.auth — it leaks
 // no information beyond "the process is up".
@@ -408,31 +519,34 @@ app.use((err, req, res, next) => {
 });
 
 // =====================================================================
-// WebSocket SSH Shell
+// WebSocket SSH Shell — encrypted application protocol
 // =====================================================================
-const safeSend = (ws, data) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(data);
-};
-
-/**
- * 协议：第一条消息必须是 JSON：{ token, name, host, port, username, auth_type, auth_value, host_fingerprint? }
- * 之后的所有消息原样写入 SSH shell。
- * 令牌放在首条消息而不是 URL 里，避免出现在访问日志/浏览器历史中。
- */
 function handleWebSocketConnection(ws, req, clientIp) {
     console.log(`[ws] client connected: ${clientIp}`);
 
-    // awaiting_auth -> connecting -> ready -> closed
-    let state = 'awaiting_auth';
+    // awaiting_handshake -> connecting -> ready -> closed
+    let state = 'awaiting_handshake';
     let sshConn = null;
     let sshStream = null;
     let idleTimer = null;
+    let sessionKey = null;
+    let nextClientSeq = 0;
+    let nextServerSeq = 0;
 
-    const sendWsError = (message) => safeSend(ws, `\r\n\u001b[31mError: ${message}\u001b[0m\r\n`);
+    const sendEncrypted = (plaintext) => {
+        if (!sessionKey || ws.readyState !== WebSocket.OPEN) return;
+        const payload = aesEncrypt(sessionKey, nextServerSeq++, plaintext, 's2c');
+        ws.send(payload);
+    };
+
+    const sendWsError = (message) => {
+        if (sessionKey) {
+            try { sendEncrypted(`\r\n\u001b[31mError: ${message}\u001b[0m\r\n`); } catch {}
+        }
+    };
 
     const authTimer = setTimeout(() => {
-        if (state === 'awaiting_auth') {
-            sendWsError('Handshake timeout');
+        if (state === 'awaiting_handshake') {
             ws.close(1008, 'Handshake timeout');
         }
     }, LIMITS.WS_AUTH_TIMEOUT_MS);
@@ -440,7 +554,9 @@ function handleWebSocketConnection(ws, req, clientIp) {
     const resetIdleTimer = () => {
         clearTimeout(idleTimer);
         idleTimer = setTimeout(() => {
-            safeSend(ws, '\r\nSession closed due to inactivity.\r\n');
+            if (sessionKey) {
+                try { sendEncrypted('\r\nSession closed due to inactivity.\r\n'); } catch {}
+            }
             ws.close(1000, 'Idle timeout');
         }, LIMITS.WS_IDLE_TIMEOUT_MS);
     };
@@ -454,69 +570,132 @@ function handleWebSocketConnection(ws, req, clientIp) {
         if (sshConn) sshConn.end();
         sshStream = null;
         sshConn = null;
+        if (sessionKey) sessionKey.fill(0);
+        sessionKey = null;
     };
 
-    // 二进制帧 = 控制消息（目前只有 resize）；文本帧 = 握手 JSON（首条）或终端输入（之后）。
-    // 键盘输入始终以文本帧发送，因此这样区分不会和任何可能的按键内容冲突。
     ws.on('message', async (message, isBinary) => {
         if (state === 'ready') {
             if (isBinary) {
-                try {
-                    const frame = ResizeFrameSchema.parse(JSON.parse(message.toString('utf-8')));
-                    if (sshStream) sshStream.setWindow(frame.rows, frame.cols, 0, 0);
-                } catch {
-                    // 畸形的控制帧直接忽略，不应影响正在进行的会话
-                }
+                // Binary frames are no longer accepted. All post-handshake
+                // traffic uses authenticated encrypted JSON text frames.
                 return;
             }
-            resetIdleTimer();
-            if (sshStream && sshStream.writable) sshStream.write(message);
+
+            try {
+                const envelope = JSON.parse(message.toString('utf8'));
+                if (envelope.v !== E2E_VERSION || envelope.type !== 'data') return;
+                if (envelope.seq !== nextClientSeq) {
+                    throw new PublicError('Invalid encrypted frame sequence');
+                }
+                nextClientSeq += 1;
+
+                const plaintext = aesDecrypt(sessionKey, envelope, 'c2s');
+                resetIdleTimer();
+
+                // Client control messages are JSON; terminal input is raw UTF-8.
+                // Resize controls are schema-validated before touching ssh2.
+                const text = plaintext.toString('utf8');
+                let handledControl = false;
+                try {
+                    const maybeControl = JSON.parse(text);
+                    if (maybeControl && maybeControl.type === 'resize') {
+                        const frame = ResizeFrameSchema.parse(maybeControl);
+                        if (sshStream) sshStream.setWindow(frame.rows, frame.cols, 0, 0);
+                        handledControl = true;
+                    }
+                } catch {
+                    // Not a control frame; treat it as terminal input.
+                }
+
+                if (!handledControl && sshStream && sshStream.writable) {
+                    sshStream.write(plaintext);
+                }
+            } catch (error) {
+                if (error instanceof PublicError) sendWsError(error.message);
+                else console.error('[ws] encrypted frame error:', error);
+                ws.close(1008, 'Invalid encrypted frame');
+            }
             return;
         }
-        // 连接建立期间/已关闭后收到的消息直接丢弃，避免重复发起 SSH 连接
-        if (state !== 'awaiting_auth' || isBinary) return;
+
+        // Handshake is the only unencrypted frame, and it contains only:
+        // RSA-OAEP wrapped ephemeral AES key + AES-GCM ciphertext.
+        if (state !== 'awaiting_handshake' || isBinary) return;
 
         state = 'connecting';
         clearTimeout(authTimer);
 
         try {
-            let payload;
+            if (Buffer.byteLength(message) > LIMITS.WS_MAX_PAYLOAD) {
+                throw new PublicError('Handshake too large');
+            }
+
+            let envelope;
             try {
-                payload = JSON.parse(message.toString());
+                envelope = JSON.parse(message.toString('utf8'));
             } catch {
-                throw new PublicError('Invalid handshake message');
-            }
-            if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-                throw new PublicError('Invalid handshake message');
+                throw new PublicError('Invalid encrypted handshake');
             }
 
-            const { token, cols, rows, ...nodeInfo } = payload;
-            if (!isValidToken(token)) {
-                sendWsError('Unauthorized');
-                ws.close(1008, 'Unauthorized');
-                return;
+            if (!envelope || envelope.v !== E2E_VERSION || envelope.type !== 'handshake') {
+                throw new PublicError('Invalid encrypted handshake');
             }
 
+            const wrappedKey = b64uDecode(envelope.key, 'wrapped key');
+            const iv = b64uDecode(envelope.iv, 'IV');
+            const ciphertext = b64uDecode(envelope.data, 'ciphertext');
+            if (iv.length !== E2E_IV_BYTES || wrappedKey.length < 256 || wrappedKey.length > 1024 ||
+                ciphertext.length < 16 || ciphertext.length > E2E_MAX_PLAINTEXT_BYTES + 16) {
+                throw new PublicError('Invalid encrypted handshake');
+            }
+
+            sessionKey = rsaUnwrapSessionKey(wrappedKey);
+
+            // Handshake uses seq=0 and the same authenticated framing primitive.
+            const plaintext = (() => {
+                const aad = Buffer.from(`ssh-gateway:v${E2E_VERSION}:handshake:0`, 'utf8');
+                try {
+                    const decipher = crypto.createDecipheriv('aes-256-gcm', sessionKey, iv);
+                    decipher.setAAD(aad);
+                    const tag = ciphertext.subarray(ciphertext.length - 16);
+                    decipher.setAuthTag(tag);
+                    return Buffer.concat([
+                        decipher.update(ciphertext.subarray(0, -16)),
+                        decipher.final(),
+                    ]);
+                } catch {
+                    throw new PublicError('Invalid encrypted handshake');
+                }
+            })();
+
+            let payload;
+            try { payload = JSON.parse(plaintext.toString('utf8')); }
+            catch { throw new PublicError('Invalid encrypted handshake'); }
+
+            const { cols, rows, ...nodeInfo } = payload || {};
             const nodeInput = NodeSchema.parse(nodeInfo);
-            // 初始 PTY 尺寸随握手一起发来，省去连接后再补发一次 resize；
-            // 缺失或超出范围时退回一个安全的默认值，而不是让整次握手失败。
             const ptySize = PtySizeSchema.safeParse({ cols, rows });
             const initialSize = ptySize.success ? ptySize.data : { cols: 80, rows: 24 };
 
-            safeSend(ws, `\r\nConnecting to ${nodeInput.name} (${nodeInput.host})...\r\n`);
+            // From this point onward every server->browser byte is encrypted.
+            sendEncrypted(`\r\nConnecting to ${nodeInput.name} (${nodeInput.host})...\r\n`);
+
             const conn = await connectSsh(nodeInput);
-            if (state === 'closed') { // 连接期间客户端已断开
+            if (state === 'closed') {
                 conn.end();
                 return;
             }
+
             sshConn = conn;
             conn.on('close', () => {
                 if (state !== 'closed') {
-                    safeSend(ws, '\r\nSSH connection closed.\r\n');
+                    try { sendEncrypted('\r\nSSH connection closed.\r\n'); } catch {}
                     ws.close();
                 }
             });
-            safeSend(ws, 'SSH connection established. Opening shell...\r\n');
+
+            sendEncrypted('SSH connection established. Opening shell...\r\n');
 
             conn.shell({
                 term: 'xterm-256color',
@@ -534,16 +713,29 @@ function handleWebSocketConnection(ws, req, clientIp) {
                     stream.end();
                     return;
                 }
+
                 sshStream = stream;
                 state = 'ready';
                 resetIdleTimer();
-                safeSend(ws, 'Shell ready.\r\n');
+                sendEncrypted('Shell ready.\r\n');
 
                 stream.on('error', (e) => console.error(`[ssh] stream error: ${e.message}`));
                 stream.on('data', (data) => {
-                    if (ws.readyState !== WebSocket.OPEN) return;
-                    ws.send(data.toString('utf-8'));
-                    // 背压：客户端消费太慢时暂停读取，避免服务端内存无限增长
+                    if (ws.readyState !== WebSocket.OPEN || !sessionKey) return;
+                    try {
+                        // Keep each encrypted WebSocket frame comfortably below
+                        // the global ws maxPayload after base64/JSON overhead.
+                        for (let offset = 0; offset < data.length; offset += E2E_MAX_PLAINTEXT_BYTES) {
+                            const chunk = data.subarray(offset, Math.min(offset + E2E_MAX_PLAINTEXT_BYTES, data.length));
+                            ws.send(aesEncrypt(sessionKey, nextServerSeq++, chunk, 's2c'));
+                        }
+                    } catch (error) {
+                        console.error('[ws] output encryption error:', error);
+                        ws.close();
+                        return;
+                    }
+
+                    // Backpressure: pause SSH reads if encrypted WS output queues up.
                     if (ws.bufferedAmount > LIMITS.WS_MAX_BUFFERED_BYTES) {
                         stream.pause();
                         const poll = setInterval(() => {
@@ -554,8 +746,9 @@ function handleWebSocketConnection(ws, req, clientIp) {
                         }, 100);
                     }
                 });
+
                 stream.on('close', () => {
-                    safeSend(ws, '\r\nSSH shell session ended.\r\n');
+                    try { sendEncrypted('\r\nSSH shell session ended.\r\n'); } catch {}
                     ws.close();
                 });
             });
@@ -568,7 +761,7 @@ function handleWebSocketConnection(ws, req, clientIp) {
                 console.error('[ws] unexpected error:', error);
                 sendWsError('Internal server error');
             }
-            ws.close();
+            ws.close(1008, 'Handshake failed');
         }
     });
 
