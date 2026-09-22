@@ -10,3 +10,18 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+
+      - key: API_TOKEN
+        sync: false
+
+      - key: ALLOWED_ORIGINS
+        sync: false
+
+      - key: TRUST_PROXY_HOPS
+        value: "1"
+
+      - key: ALLOW_PRIVATE_TARGETS
+        value: "false"
+
+      - key: REQUIRE_HOST_FINGERPRINT
+        value: "false"
