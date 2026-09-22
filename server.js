@@ -20,7 +20,6 @@ const { z, ZodError } = require('zod');
 //                           不设置时仅在非生产环境放行 http://localhost:5173 方便本地调试。
 //   TRUST_PROXY_HOPS        可选。前面有几层可信反向代理（Render 的边缘代理等），默认 0
 //   ALLOW_PRIVATE_TARGETS   可选。设为 true 才允许连接内网/回环/链路本地地址，默认禁止
-//   ALLOWED_TARGET_HOSTS    可选。逗号分隔的目标主机白名单，设置后只允许这些主机
 //   REQUIRE_HOST_FINGERPRINT可选。设为 true 则强制客户端提供 host_fingerprint（防中间人）
 const PORT = process.env.PORT || 3000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
@@ -36,7 +35,6 @@ const API_TOKEN_HASH = crypto.createHash('sha256').update(API_TOKEN).digest();
 
 const TRUST_PROXY_HOPS = Math.max(0, parseInt(process.env.TRUST_PROXY_HOPS || '0', 10) || 0);
 const ALLOW_PRIVATE_TARGETS = process.env.ALLOW_PRIVATE_TARGETS === 'true';
-const ALLOWED_TARGET_HOSTS = csv(process.env.ALLOWED_TARGET_HOSTS).map((h) => h.toLowerCase());
 const REQUIRE_HOST_FINGERPRINT = process.env.REQUIRE_HOST_FINGERPRINT === 'true';
 
 const allowedOrigins = process.env.ALLOWED_ORIGINS
