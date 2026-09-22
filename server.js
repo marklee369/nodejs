@@ -575,70 +575,8 @@ function handleWebSocketConnection(ws, req, clientIp) {
         sessionKey = null;
     };
 
-    // Frames can arrive immediately after the encrypted handshake while the SSH
-    // connection/shell is still being established. They must not be discarded,
-    // otherwise seq=0 can be lost and the next frame (seq=1) looks like a replay.
-    const pendingClientFrames = [];
-    let pendingClientBytes = 0;
-    const MAX_PENDING_CLIENT_FRAMES = 64;
-    const MAX_PENDING_CLIENT_BYTES = 256 * 1024;
-
-    const handleClientPlaintext = (plaintext) => {
-        resetIdleTimer();
-
-        const text = plaintext.toString('utf8');
-        let handledControl = false;
-        try {
-            const maybeControl = JSON.parse(text);
-            if (maybeControl && maybeControl.type === 'resize') {
-                const frame = ResizeFrameSchema.parse(maybeControl);
-                if (sshStream) {
-                    sshStream.setWindow(frame.rows, frame.cols, 0, 0);
-                } else {
-                    // The handshake already carries the initial PTY size. Queue
-                    // later resizes so the latest browser dimensions are applied
-                    // once the shell exists.
-                    if (pendingClientFrames.length >= MAX_PENDING_CLIENT_FRAMES ||
-                        pendingClientBytes + 32 > MAX_PENDING_CLIENT_BYTES) {
-                        throw new PublicError('Too many pending terminal frames', 429);
-                    }
-                    pendingClientFrames.push({ plaintext: null, resize: frame });
-                    pendingClientBytes += 32;
-                }
-                handledControl = true;
-            }
-        } catch (error) {
-            if (error instanceof PublicError) throw error;
-            // Not a control frame; treat it as terminal input.
-        }
-
-        if (!handledControl && sshStream && sshStream.writable) {
-            sshStream.write(plaintext);
-            return;
-        }
-
-        if (!handledControl && !sshStream) {
-            if (pendingClientFrames.length >= MAX_PENDING_CLIENT_FRAMES ||
-                pendingClientBytes + plaintext.length > MAX_PENDING_CLIENT_BYTES) {
-                throw new PublicError('Too many pending terminal frames', 429);
-            }
-            pendingClientFrames.push({ plaintext: Buffer.from(plaintext), resize: null });
-            pendingClientBytes += plaintext.length;
-        }
-    };
-
-    const flushPendingClientFrames = () => {
-        if (!sshStream || !sshStream.writable) return;
-        for (const frame of pendingClientFrames) {
-            if (frame.resize) sshStream.setWindow(frame.resize.rows, frame.resize.cols, 0, 0);
-            else if (frame.plaintext) sshStream.write(frame.plaintext);
-        }
-        pendingClientFrames.length = 0;
-        pendingClientBytes = 0;
-    };
-
     ws.on('message', async (message, isBinary) => {
-        if (state === 'connecting' || state === 'ready') {
+        if (state === 'ready') {
             if (isBinary) {
                 // Binary frames are no longer accepted. All post-handshake
                 // traffic uses authenticated encrypted JSON text frames.
@@ -651,11 +589,29 @@ function handleWebSocketConnection(ws, req, clientIp) {
                 if (envelope.seq !== nextClientSeq) {
                     throw new PublicError('Invalid encrypted frame sequence');
                 }
-
-                // Authenticate/decrypt before changing the sequence state.
-                const plaintext = aesDecrypt(sessionKey, envelope, 'c2s');
                 nextClientSeq += 1;
-                handleClientPlaintext(plaintext);
+
+                const plaintext = aesDecrypt(sessionKey, envelope, 'c2s');
+                resetIdleTimer();
+
+                // Client control messages are JSON; terminal input is raw UTF-8.
+                // Resize controls are schema-validated before touching ssh2.
+                const text = plaintext.toString('utf8');
+                let handledControl = false;
+                try {
+                    const maybeControl = JSON.parse(text);
+                    if (maybeControl && maybeControl.type === 'resize') {
+                        const frame = ResizeFrameSchema.parse(maybeControl);
+                        if (sshStream) sshStream.setWindow(frame.rows, frame.cols, 0, 0);
+                        handledControl = true;
+                    }
+                } catch {
+                    // Not a control frame; treat it as terminal input.
+                }
+
+                if (!handledControl && sshStream && sshStream.writable) {
+                    sshStream.write(plaintext);
+                }
             } catch (error) {
                 if (error instanceof PublicError) sendWsError(error.message);
                 else console.error('[ws] encrypted frame error:', error);
@@ -719,7 +675,14 @@ function handleWebSocketConnection(ws, req, clientIp) {
             try { payload = JSON.parse(plaintext.toString('utf8')); }
             catch { throw new PublicError('Invalid encrypted handshake'); }
 
-            const { cols, rows, ...nodeInfo } = payload || {};
+            // Access-token authentication MUST happen before any SSH connection is attempted.
+            // The token is inside the authenticated AES-GCM handshake, so it is never exposed
+            // in the URL, WebSocket headers, or plaintext transport.
+            if (REQUIRE_ACCESS_TOKEN && !isValidToken(payload?.token)) {
+                throw new PublicError('Unauthorized: invalid access token');
+            }
+
+            const { token: _token, cols, rows, ...nodeInfo } = payload || {};
             const nodeInput = NodeSchema.parse(nodeInfo);
             const ptySize = PtySizeSchema.safeParse({ cols, rows });
             const initialSize = ptySize.success ? ptySize.data : { cols: 80, rows: 24 };
@@ -762,16 +725,6 @@ function handleWebSocketConnection(ws, req, clientIp) {
 
                 sshStream = stream;
                 state = 'ready';
-                // Replay authenticated frames that arrived while the SSH shell
-                // was being established, preserving their original order.
-                try {
-                    flushPendingClientFrames();
-                } catch (error) {
-                    console.error('[ws] pending frame replay failed:', error);
-                    sendWsError('Pending terminal frame failed');
-                    ws.close(1008, 'Pending terminal frame failed');
-                    return;
-                }
                 resetIdleTimer();
                 sendEncrypted('Shell ready.\r\n');
 
